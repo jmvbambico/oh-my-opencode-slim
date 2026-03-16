@@ -8,8 +8,8 @@ function createMockContext(overrides?: {
   sessionStatusResult?: { data?: Record<string, { type: string }> };
   sessionMessagesResult?: {
     data?: Array<{
-      info?: { role: string };
-      parts?: Array<{ type: string; text?: string }>;
+      info?: { role?: string; error?: any };
+      parts?: Array<{ type?: string; text?: string }>;
     }>;
   };
   promptImpl?: (args: any) => Promise<unknown>;
@@ -571,6 +571,61 @@ describe('BackgroundTaskManager', () => {
       expect(task.error).toContain('All fallback models failed');
       // Verify session.abort was called: once between attempts + once in completeTask
       expect(ctx.client.session.abort).toHaveBeenCalledTimes(2);
+    });
+
+    test('falls back when the prompt finishes but the session message contains an error (e.g., rate limit)', async () => {
+      let promptCalls = 0;
+      const ctx = createMockContext({
+        promptImpl: async () => {
+          promptCalls += 1;
+          return {};
+        },
+      });
+
+      // Override session.messages mock to return an error ONLY on the first call
+      ctx.client.session.messages = mock(async () => {
+        if (promptCalls === 1) {
+          return {
+            data: [
+              {
+                info: {
+                  role: 'assistant',
+                  error: {
+                    name: 'APIError',
+                    data: { message: 'Rate limit exceeded' },
+                  },
+                },
+              },
+            ],
+          };
+        }
+        return { data: [] }; // Success on subsequent calls
+      });
+
+      const manager = new BackgroundTaskManager(ctx, undefined, {
+        fallback: {
+          enabled: true,
+          timeoutMs: 15000,
+          retryDelayMs: 0,
+          chains: {
+            explorer: ['openai/gpt-5.2-codex', 'opencode/gpt-5-nano'],
+          },
+        },
+      });
+
+      const task = manager.launch({
+        agent: 'explorer',
+        prompt: 'test',
+        description: 'test',
+        parentSessionId: 'parent-123',
+      });
+
+      // Yield to let the fire-and-forget async chain complete
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(task.status).toBe('running');
+      expect(promptCalls).toBe(2);
+      expect(ctx.client.session.abort).toHaveBeenCalled();
     });
 
     test('extracts content from multiple types and messages', async () => {

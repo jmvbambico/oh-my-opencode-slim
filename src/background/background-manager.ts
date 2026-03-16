@@ -267,39 +267,50 @@ export class BackgroundTaskManager {
     args: Parameters<OpencodeClient['session']['prompt']>[0],
     timeoutMs: number,
   ): Promise<void> {
+    let result: { error?: { message?: string } } | undefined;
+
     // No timeout when fallback disabled (timeoutMs = 0)
     if (timeoutMs <= 0) {
-      await this.client.session.prompt(args);
-      return;
+      result = (await this.client.session.prompt(args)) as typeof result;
+    } else {
+      const sessionId = args.path.id;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      try {
+        // Attach a no-op .catch() so that when the timeout fires and
+        // session.abort() causes the prompt to reject after the race has
+        // already settled, the late rejection does not become unhandled
+        // (which would crash the process in Node ≥15 / Bun).
+        const promptPromise = this.client.session.prompt(args);
+        promptPromise.catch(() => {});
+
+        result = (await Promise.race([
+          promptPromise,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              // Abort the running prompt so the session is no longer busy.
+              // Without this, session.prompt() continues running server-side
+              // and blocks subsequent fallback attempts on the same session.
+              this.client.session
+                .abort({ path: { id: sessionId } })
+                .catch(() => {});
+              reject(new Error(`Prompt timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
+          }),
+        ])) as typeof result;
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
-    const sessionId = args.path.id;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-
-    try {
-      // Attach a no-op .catch() so that when the timeout fires and
-      // session.abort() causes the prompt to reject after the race has
-      // already settled, the late rejection does not become unhandled
-      // (which would crash the process in Node ≥15 / Bun).
-      const promptPromise = this.client.session.prompt(args);
-      promptPromise.catch(() => {});
-
-      await Promise.race([
-        promptPromise,
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            // Abort the running prompt so the session is no longer busy.
-            // Without this, session.prompt() continues running server-side
-            // and blocks subsequent fallback attempts on the same session.
-            this.client.session
-              .abort({ path: { id: sessionId } })
-              .catch(() => {});
-            reject(new Error(`Prompt timed out after ${timeoutMs}ms`));
-          }, timeoutMs);
-        }),
-      ]);
-    } finally {
-      clearTimeout(timer);
+    if (
+      result &&
+      typeof result === 'object' &&
+      'error' in result &&
+      result.error
+    ) {
+      const err = result.error as { message?: string };
+      throw new Error(err.message || JSON.stringify(err));
     }
   }
 
@@ -425,6 +436,26 @@ export class BackgroundTaskManager {
             },
             timeoutMs,
           );
+
+          // Check if the prompt generated an error message (like a rate limit)
+          const messagesResult = await this.client.session.messages({
+            path: { id: sessionId },
+          });
+          const messages = messagesResult.data ?? [];
+          const lastMessage = messages[messages.length - 1] as {
+            info?: {
+              role?: string;
+              error?: { name?: string; data?: { message?: string } };
+            };
+          };
+
+          if (lastMessage?.info?.error) {
+            const errName = lastMessage.info.error.name || 'APIError';
+            const errMsg =
+              lastMessage.info.error.data?.message ||
+              JSON.stringify(lastMessage.info.error);
+            throw new Error(`${errName}: ${errMsg}`);
+          }
 
           succeeded = true;
           break;
